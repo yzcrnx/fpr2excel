@@ -12,3 +12,7 @@ output: excel file.
 **Usage**  
 
 python3 main.py --file xxxx.fpr
+
+**Example**  
+
+![示例图片](screenshoot.jpg)
