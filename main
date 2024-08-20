@@ -1,0 +1,1101 @@
+import argparse
+import random
+import subprocess
+import time
+import zipfile
+import re
+import json
+import os
+from openpyxl import load_workbook
+import xml.etree.ElementTree as ET
+import sqlite3
+from http import HTTPStatus
+import dashscope
+import pandas as pd
+from openpyxl.styles import Font, Border, Side, Alignment
+
+system_content = """你是一位经验丰富的网络安全专家，专注于识别和评估各种编程语言中的安全漏洞。我们需要你完成以下任务：
+
+## 背景信息
+您将帮助新手开发工程师审查代码片段，判断潜在的漏洞是否为误报，并给出详细的修复建议。假定没有任何额外的安全措施，仅基于提供的代码进行分析。
+
+## 任务清单
+1. **代码片段分析**
+    - 仔细阅读 `ShareSourceCode` 和 `AssociationCode` 中的所有代码片段。
+    - 分析 `Abstract`了解该漏洞的描述。
+    - 确认 `ShareSourceCode` 中的参数是否从前端传递。
+    - 检查 `AssociationCode` 中是否存在相应漏洞的安全措施。
+
+2. **漏洞有效性判断**
+    - 严格遵守**重要指令**中的规则，判断潜在漏洞是否确实存在。
+    - 记录判断依据。
+
+3. **漏洞修复建议**
+    - 如果漏洞存在，提供具体的修复措施或缓解策略。
+    - 结合ShareSourceCode中的snippet提供修复的代码示例。
+    - 详细标明修复的函数，使新手开发者能够直接根据您的建议进行修复。
+    - 将需要加粗的文字前后用@@@标记，代码前后需要用|||标记。
+
+4. **输出**
+    - 使用JSON数据结构进行原样输出，不要把你的思考过程输出给我。
+    - 务必使用中文答复。
+    - 按照以下格式输出分析结果：
+    ```json
+    {
+      "isVuln": true,  // 如果存在漏洞则为 true，否则为 false
+      "reason": "",    // 解释为什么认为代码存在或不存在漏洞
+      "recommendations": ""  // 结合代码提供可能的漏洞修复建议，如果isVuln为false，就不需要填写内容。
+    }
+    ```
+
+## 思考步骤
+在每次提供修复建议或漏洞描述之前，请先花几秒钟思考，确保建议的准确性和可操作性。
+
+## 重要指令
+在进行漏洞判断时，必须严格遵守以下规则
+
+- **输入验证**：
+    - **定义**：检查是否缺乏对用户输入的验证和清理。
+    - **规则**：
+        如果应用程序没有对所有外部输入进行适当的验证和清理，则视为潜在的输入验证漏洞。
+        如果对所有外部输入进行了适当的验证和清理，则不视为漏洞。
+
+- **权限控制**：
+    - **定义**：检查是否存在水平层面的数据越权。
+    - **规则**：
+        默认没有功能级别的权限校验。
+        如果代码进行了数据的权限校验，则不视为漏洞。
+
+- **敏感数据泄露**：
+    - **定义**：检查是否泄漏了password或者secret等敏感信息。
+    - **规则**：
+        如果应用程序在非日志记录的地方泄漏了password或secret等敏感信息，则视为潜在的敏感数据泄露漏洞。
+        如果敏感信息仅在日志中出现，则不视为漏洞。
+
+- **不安全的随机数**：
+    - **定义**：检查是否使用了不安全的随机数生成器。
+    - **规则**：
+        如果应用程序在生成随机数时使用了不安全的随机数生成器，并且这些随机数被用于安全关键场景（如密码学、安全令牌等），则视为潜在的不安全随机数漏洞。
+        如果随机数生成器被用于图片、文字生成或者其余不是安全关键场景的情况下，则不视为漏洞。
+
+- **VulnNameEN中有password management**：
+    - **定义**：只考虑与密码相关的安全问题。
+    - **规则**：
+        如果密码长度超过12位并且包含至少一个特殊字符，则不视为密码相关漏洞。
+        如果密码不符合上述条件，则视为潜在的密码相关漏洞。
+
+- **日志伪造**：
+    - **定义**：检查是否在日志记录时使用了不安全的字符串拼接方式。
+    - **规则**：
+        如果在日志记录时使用了+进行字符串拼接，则视为潜在的日志伪造漏洞。
+        如果没有使用+进行字符串拼接，则不视为漏洞。
+
+- **隐私泄漏**：
+    - **定义**：判断规则和敏感数据泄露一致。
+    - **规则**：
+        如果应用程序在非日志记录的地方泄漏了个人隐私信息，则视为潜在的隐私泄漏漏洞。
+        如果个人隐私信息仅在日志中出现，则不视为漏洞。
+
+JSON数据结构如下：
+```json
+{
+  "VulnNameEN": "",
+  "VulnNameCN": "",
+  "ShareSourceCode": [],
+  "AssociationCode": [],
+  "Abstract":""
+}
+```
+"""
+assistant_content = """{
+  "isVuln": true,  // 如果存在漏洞则为 true，否则为 false
+  "reason": "",     // 解释为什么认为代码存在或不存在漏洞
+  "recommendations": ""  //结合代码提供可能的漏洞修复建议，如果isVuln为false就不需要生成recommendations。
+}
+"""
+dashscope.api_key = "ooxx"
+
+
+# 提取我需要的内容到xml
+def extract_and_save(file_path, key, output_directory):
+    """从指定文件中提取指定标签之间的内容并保存到新的XML文件中"""
+    with open(file_path, 'r', encoding='utf-8') as file:
+        content = file.read()
+        pattern = rf'<{key}>(.*?)</{key}>'
+        match = re.search(pattern, content, re.DOTALL)
+        if match:
+            extracted_content = match.group(1).strip()
+
+            output_file_path = os.path.join(output_directory, f'{key}.xml')
+
+            with open(output_file_path, 'w', encoding='utf-8') as output_file:
+                output_file.write(f'<{key}>\n')
+                output_file.write(extracted_content)
+                output_file.write(f'\n</{key}>\n')
+        else:
+            print(f"No content found for key '{key}' in file '{file_path}'.")
+
+
+def get_vulnerability_json(vulnerability_type, instance_id, analysis_info, snippets, unified_node_pool, conn):
+    # Query isVuln from the VulnInfoDB table
+    c = conn.cursor()
+    c.execute("SELECT isVuln FROM VulnInfoDB WHERE VulnNameEN = ?", (vulnerability_type,))
+    is_vuln_result = c.fetchone()
+
+    if is_vuln_result is None or not is_vuln_result[0]:
+        # Skip this vulnerability because isVuln is not true
+        return None
+
+    share_source_code = []
+    association_code = []
+    # Iterate through the Trace elements
+    for trace in analysis_info.findall('Trace'):
+        for primary in trace.findall('Primary'):
+            # Find the Node element with isDefault="true"
+            default_node = primary.find('.//Node[@isDefault="true"]')
+            if default_node is not None:
+                # Get the SourceLocation element
+                source_location = default_node.find('SourceLocation')
+                action_node = default_node.find('Action')
+                action_type = None
+                action_text = None
+                if action_node is not None:
+                    # 如果 Action 节点存在
+                    action_type = action_node.get('type') if 'type' in action_node.attrib else ''
+
+                    # 检查 Action 节点是否有文本内容
+                    action_text = action_node.text.strip() if action_node.text and action_node.text.strip() else ''
+                    # 获取 Node 的 label 属性
+                target_function = default_node.get('label')
+                if target_function is None:
+                    # 如果没有 label 属性，则使用 Action 的内容
+                    target_function = action_text
+                if source_location is not None:
+                    file_path = source_location.get('path')
+                    line = source_location.get('line')
+                    snippet_id = source_location.get('snippet')
+                    snippet = snippets.get(snippet_id)
+
+                    if snippet:
+                        share_source_code.append({
+                            "VulnFilePath": file_path,
+                            "Line": line,
+                            "targetFunction": target_function,  # 添加 targetFunction
+                            "snippet": [{
+                                "FilePath": snippet['file'],
+                                "code": snippet['text'],
+                                "action": {
+                                    "type": action_type,
+                                    "content": action_text
+                                }
+                            }]
+                        })
+            # Find all NodeRef elements
+            node_refs = primary.findall('.//NodeRef')
+            for node_ref in node_refs:
+                node_id = node_ref.get('id')
+                node = unified_node_pool.get(node_id)
+                if node is not None:
+                    source_location = node.find('SourceLocation')
+                    if source_location is not None:
+                        file_path = source_location.get('path')
+                        snippet_id = source_location.get('snippet')
+                        snippet = snippets.get(snippet_id)
+                        if snippet:
+                            action = node.find('Action')
+                            association_code.append({
+                                "VulnFilePath": file_path,
+                                "snippet": [{
+                                    "FilePath": snippet['file'],
+                                    "code": snippet['text'],
+                                    "action": {
+                                        "type": action.get('type'),
+                                        "content": action.text
+                                    }
+                                }]
+                            })
+
+    vuln_json = {
+        "VulnNameEn": vulnerability_type,
+        "InstanceID": instance_id,
+        "shareSourceCode": share_source_code,
+        "AssociationCode": association_code,
+        "LLMResponse": None,
+        "isVuln": is_vuln_result[0],
+        "Level":'',
+        "Abstract":'',
+        "Reason": '',
+        "Recommendations":''
+    }
+    return vuln_json
+
+def convert_to_chinese_level(level):
+    if level == 'Critical':
+        return '严重'
+    elif level == 'High':
+        return '高危'
+    elif level == 'Medium':
+        return '中危'
+    elif level == 'Low':
+        return '低危'
+    else:
+        return '未知'
+
+def check_password_complexity(password):
+    # 这里你可以添加自己的密码复杂度检查逻辑
+    # 示例：检查密码是否包含大小写字母、数字以及特殊字符
+    has_lowercase = bool(re.search("[a-z]", password))
+    has_uppercase = bool(re.search("[A-Z]", password))
+    has_digit = bool(re.search("[0-9]", password))
+    has_special = bool(re.search("[!@#$%^&*(),.?\":{}|<>]", password))
+    return has_lowercase and has_uppercase and has_digit and has_special
+
+
+# Judge If don't need AI Response and insert LLMResponse
+def JudgeVulnerability(vuln_detail):
+    return vuln_detail
+    # VulnNameEn = vuln_detail["VulnNameEn"]
+    # Code_text = vuln_detail["shareSourceCode"][0].get("snippet")[0].get("code")
+    # TargetFunction_text = vuln_detail.get("shareSourceCode", [{}])[0].get("targetFunction", "")
+    # filepath_text = vuln_detail.get("filePath", "")
+    #
+    # LLMResponse = {
+    #     "isVuln": True,
+    #     "reason": "",
+    #     "recommendations": "/"
+    # }
+    #
+    # # 判断是否为已知的漏洞类型
+    # isVulnpredefined_keywords = [
+    #     "HTML5: Missing Content Security Policy",
+    #     "Cross-Site Request Forgery",
+    #     "Insecure Storage: Android Backup Storage",
+    #     "Insecure Transport: Disabled App Transport Security",
+    #     "Insecure SSL: Server Identity Verification Disabled",
+    #     "Insecure Transport: Weak SSL Protocol",
+    #     "Weak Encryption: Insecure Mode of Operation",
+    #     "Weak Cryptographic Hash"
+    # ]
+    # if any(keyword in VulnNameEn for keyword in isVulnpredefined_keywords):
+    #     return {**vuln_detail, "LLMResponse": None}
+    #
+    # # Log Forging 处理
+    # if "Log Forging" in VulnNameEn:
+    #     # 使用正则表达式查找包含 log 和 + 的行
+    #     log_line_with_plus = re.search(r'(.*log.*\+)', Code_text, re.IGNORECASE | re.DOTALL)
+    #
+    #     if log_line_with_plus:
+    #         LLMResponse["reason"] = "经过人工审核分析，日志输出的时候使用拼接。"
+    #         LLMResponse["isVuln"] = True
+    #     else:
+    #         LLMResponse["isVuln"] = False
+    # # Password Management 处理
+    # elif "Password Management" in VulnNameEn:
+    #     password_match = re.search(r'(\w*password\w*)\s*=\s*(\S+|"[^"]*"|\'[^\']*\')', Code_text)
+    #     if password_match:
+    #         password = password_match.group(2)
+    #         Code_text = Code_text.replace(password, '*' * len(password))
+    #         if check_password_complexity(password) and len(password) > 6:
+    #             LLMResponse["reason"] = "经过人工审核分析，密码符合复杂度并且长度超过6位，所以是误报。"
+    #             LLMResponse["isVuln"] = False
+    #         elif not any(substring in Code_text for substring in ['-1pt', '-dev', '-test', '-hmg']):
+    #             LLMResponse["reason"] = "密码配置的不是生产环境"
+    #             LLMResponse["isVuln"] = False
+    #         else:
+    #             LLMResponse["isVuln"] = True
+    #     elif "assword" in Code_text:  # 防止Password或者password
+    #         LLMResponse["reason"] = "尝试获取密码"
+    #         LLMResponse["isVuln"] = True
+    #     else:
+    #         LLMResponse["isVuln"] = True
+    # # 其他漏洞类型处理
+    # elif VulnNameEn == "Mass Assignment: Sensitive Field Exposure" or "Privacy Violation" in VulnNameEn or "System Information Leak" in VulnNameEn:
+    #     sensitive_keywords = ['password', 'secret', '密码', '密钥']
+    #     if not any(keyword.lower() in Code_text for keyword in sensitive_keywords):
+    #         LLMResponse["reason"] = "经过人工审核分析，没有password、secret等敏感信息，所以是误报。"
+    #         LLMResponse["isVuln"] = False
+    #     else:
+    #         LLMResponse["reason"] = "经过人工审核审核，存在敏感字段password/secret。"
+    #         LLMResponse["isVuln"] = True
+    #
+    # elif VulnNameEn == "System Information Leak: Internal" and "logger" in TargetFunction_text.lower():
+    #     LLMResponse["reason"] = "经过人工分析，信息通过logger输出在本地，所以是误报。"
+    #     LLMResponse["isVuln"] = False
+    #
+    # elif VulnNameEn == "Cross-Site Scripting: DOM" and "jquery.ztree" in filepath_text:
+    #     LLMResponse["reason"] = "经过人工审核分析，这个漏洞是开源组件问题，所以认为是误报。"
+    #     LLMResponse["isVuln"] = False
+    #
+    # elif VulnNameEn == "Mass Assignment: Insecure Binder Configuration":
+    #     LLMResponse["reason"] = "经过人工审核，业务代码内有检查，所以是误报。"
+    #     LLMResponse["isVuln"] = False
+    #
+    # elif VulnNameEn == "Build Misconfiguration: External Maven Dependency Repository":
+    #     LLMResponse["reason"] = "经过人工审核分析，此处是内部maven仓库源，所以是误报。"
+    #     LLMResponse["isVuln"] = False
+    #
+    # elif VulnNameEn == "Unchecked Return Value":
+    #     LLMResponse["reason"] = "人工审核觉得文件的创建和删除不需要检查返回值。"
+    #     LLMResponse["isVuln"] = False
+    #
+    # elif VulnNameEn == "Access Specifier Manipulation":
+    #     LLMResponse["reason"] = "人工审核发现数据来源前端不可控，所以认为是误报。"
+    #     LLMResponse["isVuln"] = False
+    #
+    # elif VulnNameEn == "Insecure Randomness":
+    #     LLMResponse["reason"] = "经过人工分析，预先定义了一个函数，每次生成随机数的时候都是被调用。并且生成的随机数可被预测，并不影响业务。所以觉得是误报。"
+    #     LLMResponse["isVuln"] = False
+    #
+    # elif "node_modules/" in filepath_text:
+    #     LLMResponse["reason"] = "经过人工审核分析，这是第三方依赖问题，非实际威胁。"
+    #     LLMResponse["isVuln"] = False
+    #
+    # else:
+    #     LLMResponse["isVuln"] = True
+    #
+    # # 如果 isVuln 为 True 或者其他非 False 的情况，则 LLMResponse 为空字符串
+    # if LLMResponse["isVuln"]:
+    #     return {**vuln_detail, "LLMResponse": None}
+    # else:
+    #     return {**vuln_detail, "LLMResponse": LLMResponse}
+
+
+# Add Abstract and Level
+def AddSomething(vuln_json, original_report_xml):
+    # 解析 JSON 对象以获取 InstanceId
+    instance_id = vuln_json.get('InstanceID')
+
+    # 解析 XML 字符串
+    root = ET.fromstring(original_report_xml)
+
+    # 查找所有的 <Issue> 节点
+    issues = root.findall('.//Issue')
+
+    # 过滤出匹配的 <Issue> 节点
+    for issue in issues:
+        iid = issue.attrib.get('iid')
+        if iid == instance_id:
+            # 获取 <Abstract> 节点的文本
+            abstract_text = issue.find('Abstract').text
+            # 获取 <Friority> 节点的文本
+            friority_text = issue.find('Friority').text
+
+            # 更新 vuln_json
+            vuln_json['Abstract'] = abstract_text
+            vuln_json['Level'] = friority_text
+
+            # 返回更新后的 vuln_json
+            return vuln_json
+
+    # 如果没有找到匹配项，则返回原始的 vuln_json
+    return vuln_json
+
+
+def process_vulnerabilities(vulnerabilities, snippets, unified_node_pool, original_report_xml, project_name, conn):
+    # Create project table if it doesn't exist
+    c = conn.cursor()
+    c.execute(f"""
+            CREATE TABLE IF NOT EXISTS "{project_name}" (
+                InstanceID TEXT PRIMARY KEY,
+                VulnNameEN TEXT,
+                ShareSourceCode TEXT,
+                AssociationCode TEXT,
+                LLMResponse TEXT,
+                IsVuln INTEGER,
+                Level TEXT DEFAULT '',
+                Abstract TEXT DEFAULT '',
+                Reason TEXT DEFAULT '',
+                Recommendations TEXT DEFAULT '/'
+            )
+        """)
+    conn.commit()
+    for vulnerability_type, instance_id, analysis_info in vulnerabilities:
+        # Check if the vulnerability should be processed
+        vuln_json = get_vulnerability_json(vulnerability_type, instance_id, analysis_info, snippets, unified_node_pool, conn)
+        if vuln_json is None:
+            continue
+
+        # Judge If you don't need AI Response and insert LLMResponse
+        vuln_json = JudgeVulnerability(vuln_json)
+        # print(vuln_json)
+        vuln_json = AddSomething(vuln_json, original_report_xml)
+        # 如果 LLMResponse 为 None，则插入时使用 NULL
+        LLMResponse_value = json.dumps(vuln_json["LLMResponse"], ensure_ascii=False) if vuln_json["LLMResponse"] is not None else None
+        (isVuln, Reason, Recommendations) = split_response(LLMResponse_value)
+        # print(vuln_json)
+        # 检查 InstanceID 是否已存在于表中
+        instance_id = vuln_json["InstanceID"]
+        # print(instance_id)
+        c.execute(f"SELECT InstanceID FROM \"{project_name}\" WHERE InstanceID = ?", (instance_id,))
+        existing_record = c.fetchone()
+
+        # 如果记录不存在，则插入新记录
+        if not existing_record:
+            c.execute(f"""
+                        INSERT INTO "{project_name}" (InstanceID, VulnNameEN, ShareSourceCode, AssociationCode, LLMResponse, 
+                        IsVuln, Level, 
+                        Abstract, Reason, Recommendations)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                vuln_json["InstanceID"],
+                vuln_json["VulnNameEn"],
+                json.dumps(vuln_json["shareSourceCode"], ensure_ascii=False),
+                json.dumps(vuln_json["AssociationCode"], ensure_ascii=False),
+                LLMResponse_value,
+                isVuln,  # Use the isVuln value obtained from VulnInfoDB
+                # 等级转换英文->中文
+                convert_to_chinese_level(vuln_json["Level"]),
+                vuln_json["Abstract"],
+                Reason,
+                Recommendations
+            ))
+    conn.commit()
+    # Save the final JSON to a file
+    # with open(f'{project_name}.json', 'w', encoding='utf-8') as f:
+    #     json.dump(vuln_json, f, indent=2)
+
+
+def trim_text(text):
+    # 使用正则表达式找到第一个 '{' 和最后一个 '}'
+    first_brace_index = text.find('{')
+    last_brace_index = text.rfind('}')
+
+    # 如果找不到 '{' 或 '}'，返回原始文本
+    if first_brace_index == -1 or last_brace_index == -1:
+        return text
+
+    # 删除第一个 '{' 之前的所有内容
+    trimmed_text = text[first_brace_index:]
+
+    # 删除最后一个 '}' 之后的所有内容
+    trimmed_text = trimmed_text[:last_brace_index + 1]
+
+    return trimmed_text
+
+
+def split_response(text):
+    """
+    Split the provided JSON-formatted text into its components: isVuln, reason, and recommendations.
+
+    Args:
+        text (str): A string containing the JSON-formatted data.
+
+    Returns:
+        tuple: A tuple containing the isVuln (as a boolean), reason, and recommendations.
+    """
+    # Define regular expressions to match the desired fields
+    if not text:
+        return (None, None, '/')
+    is_vuln_pattern = r'"isVuln": (.*?),'
+    reason_pattern = r'"reason": "(.*?)"'
+    recommendations_pattern = r'"recommendations": "(.*?)"'
+
+    # Perform matching
+    is_vuln_match = re.search(is_vuln_pattern, text, re.IGNORECASE)
+    reason_match = re.search(reason_pattern, text, re.IGNORECASE)
+    recommendations_match = re.search(recommendations_pattern, text, re.IGNORECASE | re.DOTALL)
+
+    # Extract matched groups
+    is_vuln = is_vuln_match.group(1).lower() == "true" if is_vuln_match else None
+    reason = reason_match.group(1) if reason_match else None
+    recommendations = recommendations_match.group(1) if recommendations_match else None
+
+    return is_vuln, reason, recommendations
+
+def get_vulnerability_details(project_name, conn):
+    # Query the VulnNameEN from the project-specific table
+    c = conn.cursor()
+    c.execute(f"SELECT InstanceID, VulnNameEN, ShareSourceCode, AssociationCode, Abstract FROM \"{project_name}\" WHERE LLMResponse IS NULL OR LLMResponse "
+              f"= '';")
+    vulnerabilities = c.fetchall()
+    # Prepare the result dictionary
+    result = []
+    # Iterate through the vulnerabilities
+    for instance_id, vuln_name_en, share_source_code, association_code, abstract in vulnerabilities:
+        # Query VulnNameCN from VulnInfo based on VulnNameEN
+        c.execute("SELECT VulnNameCN FROM VulnInfoDB WHERE VulnNameEN = ?", (vuln_name_en,))
+        vuln_name_cn_result = c.fetchone()
+        # If VulnNameCN is found, add it to the result
+        if vuln_name_cn_result:
+            vuln_name_cn = vuln_name_cn_result[0]
+        else:
+            vuln_name_cn = ''  # Or you can set a default value
+        # Format the data into a dictionary
+        vulnerability_data = {
+            "InstanceID": instance_id,
+            "VulnNameEN": vuln_name_en,
+            "VulnNameCN": vuln_name_cn,
+            "ShareSourceCode": json.loads(share_source_code) if share_source_code else '',
+            "AssociationCode": json.loads(association_code) if association_code else '',
+            "Abstract": abstract
+        }
+        result.append(vulnerability_data)
+    return result
+
+
+# Save AI response
+def save_response_to_database(project_name, instance_id, response, conn):
+    # Trim the response
+    (isVuln, Reason, Recommendations) = split_response(response)
+    c = conn.cursor()
+    # Update the database with the trimmed response and extracted fields
+    c.execute(f"""
+        UPDATE "{project_name}"
+        SET LLMResponse = ?,
+            IsVuln = ?,
+            Reason = ?,
+            Recommendations = ?
+        WHERE InstanceID = ?
+    """, (
+        response,
+        isVuln,
+        Reason,
+        Recommendations,
+        instance_id
+    ))
+    conn.commit()
+
+
+def call_with_QWen(user_content, calls_count=[0], last_call_time=time.time(), max_calls_per_minute=55, model_name="qwen-max"):
+    messages = [
+        {'role': 'system', 'content': system_content},
+        {'role': 'user', 'content': user_content},
+        {'role': 'assistant', 'content': assistant_content}
+    ]
+
+    # 控制调用频率
+    current_time = time.time()
+    elapsed_time = current_time - last_call_time
+    if calls_count[0] >= max_calls_per_minute and elapsed_time < 60:
+        wait_time = 60 - elapsed_time
+        print(f"等待 {wait_time:.2f} 秒...")
+        time.sleep(wait_time)
+        last_call_time = time.time()
+        calls_count[0] = 0  # 重置计数器
+
+    # 调用 API
+    response = dashscope.Generation.call(
+        model=model_name,
+        messages=messages,
+        seed=random.randint(1, 10000),
+        temperature=0.8,
+        top_p=0.8,
+        top_k=50,
+        result_format='message'
+    )
+
+    if response.status_code == HTTPStatus.OK:
+        choices = response.output.choices
+        result = None
+        for choice in choices:
+            json_str = choice.message.content
+            result = trim_text(json_str)
+        return result
+    else:
+        error_message = 'Request id: %s, Status code: %s, error code: %s, error message: %s' % (
+            response.request_id, response.status_code,
+            response.code, response.message
+        )
+        print(error_message)
+        return None
+
+def apply_styles_to_worksheet(worksheet):
+    """应用样式到整个工作表"""
+    for row in worksheet.iter_rows():
+        for cell in row:
+            set_cell_style(cell)
+
+def set_cell_style(cell):
+    """设置单元格的样式"""
+    if cell.value:
+        cell.border = Border(
+            left=Side(style='thin'),
+            right=Side(style='thin'),
+            top=Side(style='thin'),
+            bottom=Side(style='thin')
+        )
+        cell.alignment = Alignment(horizontal='center', vertical='center', wrapText=True)
+        cell.font = Font(name='微软雅黑', size=14)
+
+def sanitize_value(value):
+    # Define the characters to be removed
+    special_chars = ['@', r'\|\|\|', r'\*\*']
+    # Create a regular expression pattern to match the characters
+    pattern = '|'.join(special_chars)
+    # Use re.sub to replace the characters with an empty string
+    sanitized_value = re.sub(pattern, '', str(value))
+    # Replace newline characters with themselves for Excel
+    sanitized_value = sanitized_value.replace('\\n', '\n')
+    return sanitized_value
+
+
+def export_to_excel(conn, table_name, excel_file_prefix='源代码安全扫描分析报告'):
+    # SQL 查询
+    detail_query = f"""
+        SELECT
+        '{table_name}' AS "应用名称",
+        T.VulnNameEN AS "缺陷类型名称[en]",
+        V.VulnNameCN AS "缺陷类型名称[cn]",
+        COALESCE(
+            (CASE WHEN json_valid(S.ShareSourceCode) THEN json_extract(S.ShareSourceCode, '$[0].VulnFilePath') ELSE NULL END),
+            '/'
+        ) AS "影响文件",
+        COALESCE(
+            (CASE WHEN json_valid(S.ShareSourceCode) THEN json_extract(S.ShareSourceCode, '$[0].Line') ELSE NULL END),
+            '/'
+        ) AS "行数",
+        COALESCE(
+            (CASE WHEN json_valid(S.ShareSourceCode) THEN json_extract(S.ShareSourceCode, '$[0].snippet[0].code') ELSE NULL END),
+            '/'
+        ) AS "相关代码",
+        COALESCE(
+            (CASE WHEN json_valid(S.ShareSourceCode) THEN json_extract(S.ShareSourceCode, '$[0].targetFunction') ELSE NULL END),
+            '/'
+        ) AS "存在缺陷的变量/函数",
+        COALESCE(
+            (CASE WHEN T.IsVuln = 1 THEN '否' ELSE '是' END), '是'
+        ) AS "是否误报",
+        ifnull(V.VulnDescribe, '/') AS "漏洞描述",
+        ifnull(T.Level, '/') AS "漏洞等级",
+        ifnull(T.Recommendations, '/') AS "修复建议",
+        '/' AS "修复状态",
+        '/' AS "修复日期",
+        '/' AS "修复备注",
+        ifnull(T.Reason, '/') AS "备注"
+    FROM
+        "{table_name}" T
+    LEFT JOIN
+        VulnInfoDB V ON T.VulnNameEN = V.VulnNameEN
+    LEFT JOIN
+        "{table_name}" S ON T.InstanceID = S.InstanceID
+    WHERE
+        T.InstanceID IS NOT NULL;
+    """
+    df = pd.read_sql_query(detail_query, conn)
+    new_excel_file = f"{table_name}{excel_file_prefix}.xlsx"
+    workbook = load_workbook('./demo.xlsx')
+    VulnDetailSheet = workbook['漏洞详细']
+    # 写入数据到Excel文件
+    for idx, row_data in enumerate(df.itertuples(index=False), start=2):
+        VulnDetailSheet.row_dimensions[idx].height = 50
+        for col_idx, cell_value in enumerate([idx - 1] + list(row_data), start=1):
+            cell = VulnDetailSheet.cell(row=idx, column=col_idx, value=cell_value)
+            # Sanitize cell value
+            sanitized_value = sanitize_value(cell_value)
+            cell = VulnDetailSheet.cell(row=idx, column=col_idx, value=sanitized_value)
+            # Enable text wrapping for the cell
+            cell.alignment = Alignment(wrap_text=True)
+            set_cell_style(cell)
+
+    # 保存Excel文件
+    workbook.save(new_excel_file)
+
+    # 填充漏洞汇总表
+    VulnSummarySheet = workbook['漏洞汇总']
+    summary_query = f"""
+    SELECT
+        V.VulnNameCN AS "漏洞类型名称",
+        T.Level AS "风险等级",
+        SUM(CASE WHEN T.IsVuln = 1 THEN 1 ELSE 0 END) AS "人工核实数",
+        COUNT(*) AS "脚本扫描数"
+    FROM
+        "{table_name}" T
+    LEFT JOIN
+        [VulnInfoDB] V ON V.VulnNameEN = T.VulnNameEN
+    WHERE
+        T.IsVuln = 1
+    GROUP BY
+        V.VulnNameCN, T.Level;
+    """
+    # 执行 SQL 查询
+    summary_df = pd.read_sql_query(summary_query, conn)
+
+    # 计算总漏洞数
+    total_vulnerabilities_num = summary_df['人工核实数'].sum()
+
+    # 创建一个字典来存储漏洞等级的统计
+    vulnerability_stats = summary_df.groupby('风险等级')['人工核实数'].sum().to_dict()
+
+    # 填充漏洞统计数据
+    VulnSummarySheet['F4'] = total_vulnerabilities_num
+    VulnSummarySheet['G4'] = vulnerability_stats.get('严重', 0)
+    VulnSummarySheet['H4'] = vulnerability_stats.get('高危', 0)
+    VulnSummarySheet['I4'] = vulnerability_stats.get('中危', 0)
+    VulnSummarySheet['J4'] = vulnerability_stats.get('低危', 0)
+
+    # 将项目名称设置为 B4 和 B11 的值
+    VulnSummarySheet['B4'] = table_name
+    VulnSummarySheet['B11'] = table_name
+
+    # 填充漏洞详细信息到漏洞汇总表
+    start_row = 10
+    for i, (index, row) in enumerate(summary_df.iterrows(), start=1):
+        VulnSummarySheet[f'C{start_row + i}'] = row['漏洞类型名称']
+        VulnSummarySheet[f'D{start_row + i}'] = row['风险等级']
+        VulnSummarySheet[f'E{start_row + i}'] = row['人工核实数']
+        VulnSummarySheet[f'F{start_row + i}'] = row['脚本扫描数']
+        VulnSummarySheet[f'G{start_row + i}'] = '/'
+
+    # 应用样式到工作表
+    apply_styles_to_worksheet(VulnSummarySheet)
+
+    # 保存工作簿
+    workbook.save(new_excel_file)
+
+
+def process_and_save_result(project_name, vulnerability_details, conn):
+    # Set up the initial values for call tracking
+    calls_count = [0]
+    last_call_time = time.time()
+    # Iterate through the vulnerability details
+    for vulnerability in vulnerability_details:
+        # Construct the user content for the query
+        user_content = {
+            "VulnNameEN": vulnerability["VulnNameEN"],
+            "VulnNameCN": vulnerability["VulnNameCN"],
+            "ShareSourceCode": vulnerability["ShareSourceCode"],
+            "AssociationCode": vulnerability["AssociationCode"],
+            "Abstract": vulnerability["Abstract"]
+        }
+        user_content_str = json.dumps(user_content, ensure_ascii=False)
+
+        # Call the API to get the LLM response
+        response = call_with_QWen(user_content_str, max_calls_per_minute=59, model_name="qwen-max")
+        if response is not None:
+            # Save the response to the database
+            save_response_to_database(project_name, vulnerability["InstanceID"], response, conn)
+
+            # Update the call tracking
+            calls_count[0] += 1
+            last_call_time = time.time()
+        else:
+            print("Failed to get a response for InstanceID:", vulnerability["InstanceID"])
+
+
+def initProcess(arg, project_name):
+    extract_to_dir = os.path.join("extracted_files", project_name)
+    if not os.path.exists(extract_to_dir):
+        os.makedirs(extract_to_dir)
+        # 解压文件
+    with zipfile.ZipFile(arg.file, 'r') as zip_ref:
+        zip_ref.extractall(extract_to_dir)
+    # 使用 ReportGenerator.bat 生成报告
+    reportgen_command = [
+        'ReportGenerator',
+        '-format', 'xml',
+        '-template', 'code.xml',
+        '-f', os.path.join(extract_to_dir, f'Original.xml'),
+        '-source', arg.file
+    ]
+    try:
+        subprocess.run(reportgen_command, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"错误：生成报告时发生错误：{e}")
+    except Exception as e:
+        print(f"错误：未知错误：{e}")
+    # Extract XML files
+    for key in ['Vulnerabilities', 'Snippets', 'UnifiedNodePool']:
+        extract_and_save(os.path.join(extract_to_dir, 'audit.fvdl'), key, extract_to_dir)
+    try:
+        # Load XML files
+        vulnerabilities_xml_path = os.path.join(extract_to_dir, 'Vulnerabilities.xml')
+        snippets_xml_path = os.path.join(extract_to_dir, 'Snippets.xml')
+        unified_node_pool_xml_path = os.path.join(extract_to_dir, 'UnifiedNodePool.xml')
+        original_report_xml_path = os.path.join(extract_to_dir, 'Original.xml')
+        original_report_xml = ''
+        with open(original_report_xml_path, 'r', encoding='utf-8') as f:
+            original_report_xml = f.read()
+        # parse vulnerabilities_xml_path
+        with open(vulnerabilities_xml_path, 'r', encoding='utf-8') as f:
+            xml_content = f.read()
+        root = ET.fromstring(xml_content)
+        vulnerabilities = []
+        for vulnerability in root.findall('Vulnerability'):
+            class_info = vulnerability.find('ClassInfo')
+            type_ = class_info.find('Type').text
+            subtype = class_info.find('Subtype')
+            vulnerability_type = f"{type_}: {subtype.text}" if subtype is not None else type_
+            instance_id = vulnerability.find('InstanceInfo/InstanceID').text
+            analysis_info = vulnerability.find('AnalysisInfo/Unified')
+            # Process the vulnerability and add it to the list
+            vulnerabilities.append((vulnerability_type, instance_id, analysis_info))
+        # parse snippets_xml_path
+        snippets = {}
+        for snippet in ET.fromstring(open(snippets_xml_path, 'r', encoding='utf-8').read()):
+            snippet_id = snippet.get('id')
+            snippets[snippet_id] = {'file': snippet.find('File').text, 'text': snippet.find('Text').text}
+        # parse unified_node_pool_xml_path
+        unified_node_pool = {}
+        for node in ET.fromstring(open(unified_node_pool_xml_path, 'r', encoding='utf-8').read()):
+            node_id = node.get('id')
+            unified_node_pool[node_id] = node
+    except FileNotFoundError as e:
+        print(e)
+    finally:
+        return vulnerabilities, snippets, unified_node_pool, original_report_xml
+
+def create_title(document):
+    # 添加空行以使文本垂直居中
+    for _ in range(7):
+        document.add_paragraph()
+    # 添加标题
+    title = document.add_heading(level=0)
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER  # 居中默认带下划线
+    run = title.add_run(f"{systemName}源代码安全扫描分析报告")
+    # 设置字体
+    run.font.name = '微软雅黑'
+    run._element.rPr.rFonts.set(qn('w:eastAsia'), '微软雅黑')
+    # 设置字体大小和其他属性
+    run.font.size = Pt(48)
+    run.font.color.rgb = RGBColor(0, 0, 0)
+    run.underline = False
+    # 在当前文档最后添加一页
+    document.add_page_break()
+
+
+# 添加编号标题的函数
+def add_numbered_heading(document, text, level=0):
+    # 更新当前级别的编号
+    heading_counters[level] += 1
+    # 重置更低级别的编号
+    for i in range(level + 1, len(heading_counters)):
+        heading_counters[i] = 0
+
+    # 生成标题编号
+    heading_number = '.'.join(str(num) for num in heading_counters[:level + 1] if num > 0)
+    heading_text = f"{heading_number} {text}"
+
+    # 添加标题并居中对齐
+    title = document.add_heading(level=level)
+    title.alignment = WD_ALIGN_PARAGRAPH.LEFT  # 左对齐
+
+    # 添加带有特定字体的文本
+    run = title.add_run(heading_text)
+
+    # 设置字体
+    run.font.name = '微软雅黑'
+    run._element.rPr.rFonts.set(qn('w:eastAsia'), '微软雅黑')
+
+    # 设置字体大小
+    if level == 0:
+        run.font.size = Pt(48)  # 例如，24点字体大小
+    elif level == 1:
+        run.font.size = Pt(18)  # 小二号字体大小
+    elif level == 2:
+        run.font.size = Pt(16)  # 三号字体大小
+
+    # 设置文字颜色为黑色
+    run.font.color.rgb = RGBColor(0, 0, 0)
+
+    return title
+
+def create_and_format_table(document, headers, rows):
+    # 如果rows为空，创建一个空的占位行
+    if not rows:
+        empty_row = ["/"] * len(headers)
+        rows = [empty_row]
+
+    # 创建一个表格
+    table = document.add_table(rows=len(rows) + 1, cols=len(headers))
+    # 设置标题行
+    hdr_cells = table.rows[0].cells
+    for i, header in enumerate(headers):
+        hdr_cells[i].text = header
+        cell_paragraph = hdr_cells[i].paragraphs[0]
+        run = cell_paragraph.runs[0]
+        run.font.name = '微软雅黑'
+        run._element.rPr.rFonts.set(qn('w:eastAsia'), '微软雅黑')
+        run.font.size = Pt(10.5)  # 五号字
+        run.font.bold = True
+        # 设置背景色为灰色
+        cell_shading = OxmlElement('w:shd')
+        cell_shading.set(qn('w:fill'), 'D3D3D3')
+        hdr_cells[i]._element.get_or_add_tcPr().append(cell_shading)
+        set_cell_border(hdr_cells[i], top={"sz": "12", "val": "single", "color": "000000"},
+                        bottom={"sz": "12", "val": "single", "color": "000000"},
+                        left={"sz": "12", "val": "single", "color": "000000"},
+                        right={"sz": "12", "val": "single", "color": "000000"})
+        # 设置水平和垂直居中
+        cell_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        hdr_cells[i].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+
+    # 设置内容行
+    for row_idx, row_data in enumerate(rows, start=1):
+        row_cells = table.rows[row_idx].cells
+        for col_idx, cell_data in enumerate(row_data):
+            row_cells[col_idx].text = cell_data
+            cell_paragraph = row_cells[col_idx].paragraphs[0]
+            run = cell_paragraph.runs[0]
+            run.font.name = '微软雅黑'
+            run._element.rPr.rFonts.set(qn('w:eastAsia'), '微软雅黑')
+            run.font.size = Pt(10.5)  # 五号字
+            # 设置边框
+            set_cell_border(row_cells[col_idx], top={"sz": "12", "val": "single", "color": "000000"},
+                            bottom={"sz": "12", "val": "single", "color": "000000"},
+                            left={"sz": "12", "val": "single", "color": "000000"},
+                            right={"sz": "12", "val": "single", "color": "000000"})
+            # 设置水平和垂直居中
+            cell_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            row_cells[col_idx].vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+
+def add_paragraph(document, text, font_color=None, tool_counts=None, audit_counts=None):
+    # 替换所有\n为Word中的回车
+    text = text.replace('\n', '\r')
+
+    # 处理表格
+    table_parts = text.split('|||')
+    final_text = []
+
+    for i, part in enumerate(table_parts):
+        if i % 2 == 0:  # 常规文本
+            # 处理@@@，将需要加粗的文本标记出来
+            bold_parts = part.split('@@@')
+            for j, bold_part in enumerate(bold_parts):
+                if j % 2 == 0:  # 常规文本
+                    final_text.append({'text': bold_part, 'bold': False})
+                else:  # 需要加粗的文本
+                    final_text.append({'text': bold_part, 'bold': True})
+        else:  # 需要放入表格的文本
+            add_text_to_table(document, part)
+
+    # 创建段落
+    paragraph = document.add_paragraph()
+    paragraph.paragraph_format.first_line_indent = Pt(28)  # 首行缩进2字符（约28点）
+
+    # 插入文本和加粗处理
+    for part in final_text:
+        run = paragraph.add_run(part['text'])
+        run.bold = part['bold']
+        # 设置字体
+        run.font.name = '微软雅黑'
+        run._element.rPr.rFonts.set(qn('w:eastAsia'), '微软雅黑')
+        run.font.size = Pt(12)
+        # 设置字体颜色，默认黑色
+        if font_color:
+            run.font.color.rgb = font_color
+        else:
+            run.font.color.rgb = RGBColor(0, 0, 0)
+
+    # 如果有统计数据，使用f-string将数据插入到文本中
+    if tool_counts and audit_counts:
+        summary_text = (
+            f"本次工具共发现安全漏洞{tool_counts['total']}个，其中严重漏洞{tool_counts['严重']}个、"
+            f"高危漏洞{tool_counts['高危']}个、中危漏洞为{tool_counts['中危']}个、低危漏洞为{tool_counts['低危']}个；"
+            f"其中经过人工分析后，确认存在的安全漏洞{audit_counts['total']}个，"
+            f"严重漏洞{audit_counts['严重']}个、高危漏洞{audit_counts['高危']}个、"
+            f"中危漏洞为{audit_counts['中危']}个、低危漏洞为{audit_counts['低危']}个。"
+            "下表汇总了本次渗透测试发现的安全漏洞及相应的数量："
+        )
+        run = paragraph.add_run(summary_text)
+        run.font.name = '微软雅黑'
+        run._element.rPr.rFonts.set(qn('w:eastAsia'), '微软雅黑')
+        run.font.size = Pt(12)
+        if font_color:
+            run.font.color.rgb = font_color
+        else:
+            run.font.color.rgb = RGBColor(0, 0, 0)
+
+def generateFirst(document,systemName):
+    # 添加首页
+    create_title(document)
+    # 添加一级标题
+    add_numbered_heading(document, "概述", level=1)
+    # 添加二级标题
+    add_numbered_heading(document, "扫描方式", level=2)
+    add_paragraph(document,
+                  "采用白盒方式，检查代码中存在安全漏洞的行为，对指定应用进行源代码的安全扫描、人工分析。检测是否存在可被攻击者真实利用的安全弱点，评估可能存在的技术风险和业务风险及风险的严重程度，为制定相应的安全措施与解决方案提供实际的依据。")
+    # 添加二级标题
+    add_numbered_heading(document, "代码扫描范围", level=2)
+    add_paragraph(document, "下表列出了本次安全扫描对象对象：")
+    headers1 = ["应用名称", "代码地址", "版本", "扫描时间"]
+    # 获取当前日期
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    rows1 = [
+        [systemName, "/", "/", current_date]
+    ]
+    create_and_format_table(document, headers1, rows1)
+    # 添加二级标题
+    add_numbered_heading(document, "代码描述", level=2)
+    # 第二个表格
+    # KLOC = extract_number_from_text(f'{systemName}.xml')
+    headers2 = ["代码主要功能", "代码行数", "开发语言", "备注"]
+    rows2 = [
+        ["/", "/", "/", "/"]
+    ]
+    create_and_format_table(document, headers2, rows2)
+
+    # 添加二级标题
+    add_numbered_heading(document, "工具信息", level=2)
+    headers3 = ["工具名称", "工具版本"]
+    rows3 = [
+        ["Fortify_SCA", "23.2.0"],
+        ["Jetbrain Idea", "2021.3.2"]
+    ]
+    create_and_format_table(document, headers3, rows3)
+    # 添加二级标题
+    add_numbered_heading(document, "漏洞结果汇总", level=2)
+
+    add_paragraph(document, "ooxxoo", None, result["tool_counts"], result["audit_counts"])
+    headers4 = ["漏洞类型名称", "工具发现数量", "人工确认存在数量", "风险等级", "漏洞状态"]
+    # 过滤掉 confirmed_by_human 为 0 的记录
+    filtered_data_dict = {k: v for k, v in result['defect_types'].items() if v['confirmed_by_human'] != 0}
+
+    # # 提取数据
+    # rows4 = [[key, str(value['discovered_by_tool']), str(value['confirmed_by_human']), value['severity'], '存在'] for key, value in
+    #          filtered_data_dict.items()]
+
+    # 提取数据并根据“风险等级”排序
+    rows4 = sorted(
+        [
+            [key, str(value['discovered_by_tool']), str(value['confirmed_by_human']), value['severity'], '存在']
+            for key, value in filtered_data_dict.items()
+        ],
+        key=lambda row: SEVERITY_ORDER.index(row[3])
+    )
+
+    # 调用函数创建表格
+    create_and_format_table(document, headers4, rows4)
+    # 在当前文档最后添加一页
+    document.add_page_break()
+
+def export_to_word(conn, project_name):
+    # 创建Word
+    document = Document()
+    generateFirst(document, project_name)
+    return None
+
+
+def main(args):
+    # Check if the database exists
+    if not os.path.exists(args.db):
+        print(f"数据库文件 '{args.db}' 不存在，请检查文件路径是否正确。")
+        return
+    # Get the project name from the filename without extension
+    project_name = os.path.splitext(os.path.basename(args.file))[0]
+    print(f"正在分析{project_name}项目中 ~ ")
+    # Init something from FPR
+    (Vulnerabilities, snippets, unified_node_pool, original_report_xml) = initProcess(args, project_name)
+    # Connect to database
+    conn = sqlite3.connect(args.db)
+    # # Process each vulnerability and insert into db
+    process_vulnerabilities(Vulnerabilities, snippets, unified_node_pool, original_report_xml, project_name, conn)
+    # Get all vulnerabilities detail for AI
+    vulnerability_details = get_vulnerability_details(project_name, conn)
+    print("正在对模型进行提问 ~ ")
+    process_and_save_result(project_name, vulnerability_details, conn)
+    # print("正在导出excel～")
+    print("正在输出表格 ~ ")
+    export_to_excel(conn, project_name)
+    # print("正在生成word～")
+    # export_to_word(conn, project_name)
+    # Close the database connection
+    conn.close()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Process some integers.')
+    parser.add_argument('--file', type=str, help='Path to the FPR file', required=False, default='coop-join.fpr')
+    parser.add_argument('--extract-to', type=str, default='extracted_files', help='Directory to extract files to')
+    parser.add_argument('--db', type=str, default='new_vulnerability_info.db', help='Path to the SQLite database file')
+    args = parser.parse_args()
+    main(args)
